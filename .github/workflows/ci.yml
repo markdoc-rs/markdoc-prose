@@ -1,0 +1,189 @@
+# CI for markdoc-prose — https://github.com/markdoc-rs/markdoc-prose
+#
+# The gate itself is in `.github/scripts/check.sh`, not here, so release.yml
+# runs exactly the same set before it publishes anything. A second list of
+# steps drifts, and the half that drifts is always the one nobody watches.
+#
+# ## The cache
+#
+# Cargo.lock holds 542 packages, nearly all of them harper-core's, and about
+# 230 of them are built on any one target. Swatinem/rust-cache keys on the
+# lock (and the toolchain), so a run that changes no dependency does not
+# build harper-core's again.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: markdoc-prose
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: markdoc-prose
+
+      - name: check.sh
+        run: bash markdoc-prose/.github/scripts/check.sh markdoc-prose
+
+      # The one check that is about a corpus rather than about the code.
+      #
+      # Deliberately a corpus built here, with documents in it. The smoke
+      # test markdoc-tools ran pointed a linter at examples/, which holds a
+      # config and no documents, so it read zero files and would have
+      # passed with every rule removed. This one holds one known fault from
+      # each place rules come from -- a house rule at error level, one of
+      # harper's own -- plus two things that must NOT be reported: an
+      # `etc.` in frontmatter and a `{% $product %}` in a sentence. The
+      # counts are exact, so a finding that goes missing and one that leaks
+      # through the pre-processor both fail it.
+      - name: Find a fault in a corpus, and say so in JSON
+        run: |
+          set -eu
+          corpus="${RUNNER_TEMP}/corpus"
+          mkdir -p "$corpus"
+          cat > "$corpus/markdoc-prose.toml" <<'TOML'
+          [[rule]]
+          name = "Etc"
+          level = "error"
+          message = "Avoid '%s' in lists. Name the specific items."
+          patterns = ['\betc\.']
+          TOML
+          cat > "$corpus/bad.md" <<'MD'
+          ---
+          title: Screws, bolts, etc.
+          ---
+
+          Screws, bolts, etc. go in the tray.
+          MD
+          cat > "$corpus/engine.md" <<'MD'
+          # Fitting
+
+          Please attach the the cable to {% $product %} before you start.
+          MD
+          cat > "$corpus/ok.md" <<'MD'
+          # Fine
+
+          A paragraph with nothing wrong in it.
+          MD
+
+          set +e
+          ./markdoc-prose/target/release/markdoc-prose --json --root "$corpus" > "${RUNNER_TEMP}/report.json"
+          code=$?
+          set -e
+
+          cat "${RUNNER_TEMP}/report.json"
+          # Exit 1 is "found something at error level", and it is what a
+          # hook and a CI step both read. A green run on a corpus with an
+          # error-level fault in it is the failure this step exists to catch.
+          [ "$code" = 1 ] || { echo "::error::markdoc-prose exited ${code} on a corpus with an error-level fault" >&2; exit 1; }
+          # Matched to the end of the line, with the comma optional, so `1`
+          # cannot pass as `10` and key order does not matter.
+          expect() {
+            grep -qE "$1" "${RUNNER_TEMP}/report.json" || {
+              echo "::error::markdoc-prose --json: expected $1" >&2; exit 1; }
+          }
+          # Three files read: not zero, and none dropped on the way.
+          expect '"files": 3,?$'
+          expect '"configured": true,?$'
+          # The house rule, once: the body's `etc.` and not the frontmatter's.
+          expect '"rule": "Etc"'
+          expect '"errors": 1,?$'
+          # harper's, and nothing else: no stand-in reported as a misspelling.
+          expect '"rule": "RepeatedWords"'
+          expect '"warnings": 1,?$'
+          echo "markdoc-prose finds both faults, reports them as JSON, and nothing else"
+
+      # "The output is the same for any n" is a promise the README makes
+      # about --jobs, and the unit tests keep it for the library with
+      # in-memory documents. This keeps it for the binary: files read on the
+      # threads that lint them, one engine per thread, a release build.
+      # 64 files, past the 49 that four threads need -- one is added only
+      # for every 16 -- and each long enough that the other three get pages
+      # before the calling thread has finished the list: measured, the
+      # four-thread run keeps two cores busy and takes half the time.
+      - name: One thread or four, the same output
+        run: |
+          set -eu
+          many="${RUNNER_TEMP}/many"
+          mkdir -p "$many"
+          cat > "$many/markdoc-prose.toml" <<'TOML'
+          [[rule]]
+          name = "Etc"
+          level = "error"
+          message = "Avoid '%s' in lists. Name the specific items."
+          patterns = ['\betc\.']
+          TOML
+          filler='The robot drives to the station and waits there until the operator confirms the mission.'
+          i=0
+          while [ "$i" -lt 64 ]; do
+            {
+              printf '# Page %d\n\n' "$i"
+              j=0
+              while [ "$j" -lt 40 ]; do printf '%s\n\n' "$filler"; j=$((j + 1)); done
+              case $((i % 3)) in
+                0) printf 'Screws, bolts, etc. go in tray %d.\n' "$i" ;;
+                1) printf 'Please attach the the cable to station %d.\n' "$i" ;;
+                *) printf 'Nothing is wrong on page %d.\n' "$i" ;;
+              esac
+            } > "$many/page-$(printf '%02d' "$i").md"
+            i=$((i + 1))
+          done
+
+          bin=./markdoc-prose/target/release/markdoc-prose
+          for jobs in 1 4; do
+            set +e
+            "$bin" --json --jobs "$jobs" --root "$many" > "${RUNNER_TEMP}/jobs-$jobs.json"
+            code=$?
+            set -e
+            [ "$code" = 1 ] || { echo "::error::--jobs $jobs exited ${code}" >&2; exit 1; }
+          done
+          # Not two empty reports agreeing: 22 pages hold an `etc.`, 21 a
+          # repeated word, and every one of the 64 was read.
+          for want in '"files": 64,?$' '"errors": 22,?$' '"warnings": 21,?$'; do
+            grep -qE "$want" "${RUNNER_TEMP}/jobs-1.json" || {
+              echo "::error::--jobs 1: expected $want" >&2; exit 1; }
+          done
+          cmp "${RUNNER_TEMP}/jobs-1.json" "${RUNNER_TEMP}/jobs-4.json" || {
+            echo "::error::--jobs 4 printed something different from --jobs 1" >&2; exit 1; }
+          echo "64 files, 43 findings, byte-identical on one thread and on four"
+
+  # ────────────────────────────────────────────────────────────────────
+  # markdoc-prose is released for Windows and macOS as well as Linux. The
+  # gate above only proves Linux; this runs the tests on the other two,
+  # where the thread scheduler and the timer the threading tests lean on
+  # actually differ.
+  # ────────────────────────────────────────────────────────────────────
+  test:
+    name: test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: markdoc-prose
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: markdoc-prose
+          key: test-${{ matrix.os }}
+
+      - name: cargo test
+        working-directory: markdoc-prose
+        run: cargo test --all-targets

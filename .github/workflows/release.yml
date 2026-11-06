@@ -1,0 +1,225 @@
+# Release for markdoc-prose — https://github.com/markdoc-rs/markdoc-prose
+#
+# One tag publishes one binary per platform, all four from GitHub-hosted
+# runners, each with a .sha256 beside it:
+#
+#   markdoc-prose-linux-x86_64          CI runners, and Linux authoring
+#   markdoc-prose-windows-x86_64.exe    Windows authoring
+#   markdoc-prose-macos-aarch64         Apple Silicon
+#   markdoc-prose-macos-x86_64          Intel Macs
+#
+# ## Nothing has to move to these yet
+#
+# Before this repository was split out, markdoc-prose shipped inside one
+# archive with markdoc-lint and markdoc-ls, markdoc-tools-<slug>.tar.gz, and
+# that archive, at a pinned version, is what its consumers download today.
+# A published release does not disappear when a repository splits, so they
+# keep working unchanged. Moving one onto these assets is a change to its
+# pin, made once a release here exists.
+#
+# ## Why a bare binary and not a tar.gz
+#
+# The archive existed to keep three binaries and a VERSION file together.
+# This is one file, so it ships as one, the same shape as tw's.
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  # Nothing is published until this passes. Same check.sh ci.yml runs, so
+  # a release cannot hold a build the ordinary gate would have rejected.
+  # ────────────────────────────────────────────────────────────────────
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: markdoc-prose
+
+      - name: The tag and Cargo.toml have to agree
+        working-directory: markdoc-prose
+        run: |
+          set -eu
+          case "${GITHUB_REF}" in
+            refs/tags/*) ;;
+            *) echo "::error::${GITHUB_REF} is not a tag." >&2; exit 1 ;;
+          esac
+          # `markdoc-prose --version` is what a writer reports in a bug, so
+          # a release whose binary disagrees with its tag is one nobody can
+          # reason about afterwards.
+          tag="${GITHUB_REF_NAME%%-*}"
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [ "$version" = "$tag" ] || {
+            echo "::error::Cargo.toml says ${version}, tag says ${tag}" >&2; exit 1; }
+          echo "markdoc-prose ${tag}"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: markdoc-prose
+
+      - name: check.sh
+        run: bash markdoc-prose/.github/scripts/check.sh markdoc-prose
+
+  # ────────────────────────────────────────────────────────────────────
+  # The binary, per platform. One matrix, three runner images, one release.
+  # ────────────────────────────────────────────────────────────────────
+  build:
+    name: ${{ matrix.slug }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl and statically linked, so one Linux binary runs on a CI
+          # image older than the runner that built it.
+          - { slug: linux-x86_64,   os: ubuntu-latest,  target: x86_64-unknown-linux-musl, exe: "" }
+          - { slug: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc,    exe: ".exe" }
+          # macos-latest is Apple Silicon, and x86_64-apple-darwin
+          # cross-compiles from it because Xcode ships both slices of the
+          # SDK. Safe here: nothing markdoc-prose builds is C, apart from
+          # psm's assembly (markdoc's stack growth), which Xcode's clang
+          # builds for either slice, as it builds ring's C for tw.
+          - { slug: macos-aarch64,  os: macos-latest,   target: aarch64-apple-darwin,      exe: "" }
+          - { slug: macos-x86_64,   os: macos-latest,   target: x86_64-apple-darwin,       exe: "" }
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: markdoc-prose
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: markdoc-prose
+          key: ${{ matrix.slug }}
+
+      # As in tw, for ring there: markdoc's stack growth (stacker, through
+      # psm, from markdoc-lint's markdoc) assembles a few lines with the C
+      # compiler -- `cargo tree -e normal,build --target
+      # x86_64-unknown-linux-musl -i cc` shows the path -- so the musl target
+      # needs a musl-targeting one; the other three targets have one.
+      # Without it cc-rs fails: failed to find tool "x86_64-linux-musl-gcc".
+      - name: musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        shell: bash
+        working-directory: markdoc-prose
+        run: |
+          set -eu
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+            export RUSTFLAGS="-C target-feature=+crt-static"
+          fi
+          cargo build --release --target "${{ matrix.target }}"
+
+      - name: Name it for the platform
+        shell: bash
+        run: |
+          set -eu
+          asset="markdoc-prose-${{ matrix.slug }}${{ matrix.exe }}"
+          cp "markdoc-prose/target/${{ matrix.target }}/release/markdoc-prose${{ matrix.exe }}" "$asset"
+
+          # No pipeline. `set -e` does not fire on a non-final command in
+          # one, so a hasher that failed would leave an EMPTY .sha256 and
+          # this step would report success -- and a consumer that verifies,
+          # as tw does every release it downloads, would refuse a release
+          # that looked fine here. The asset is already named for the
+          # platform, so neither hasher needs its output rewritten.
+          # sha256sum on Linux and Git Bash, shasum on macOS.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+          # The step checks its own work: a published checksum that does
+          # not check out is worse than none, because a consumer that
+          # verifies refuses the release and one that does not never
+          # finds out.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -c "$asset.sha256"
+          else
+            shasum -a 256 -c "$asset.sha256"
+          fi
+          echo "--- $asset: $(wc -c < "$asset") bytes"
+
+      # A binary that will not start is worse than one that was never built:
+      # the consumer caches it and reports a tool that is "installed". Every
+      # target but the Intel Mac cross-build can run on the runner that
+      # produced it. Two documents, one fault from each place rules come
+      # from, and exact counts, as in ci.yml.
+      - name: It runs, and it finds things
+        if: matrix.slug != 'macos-x86_64'
+        shell: bash
+        run: |
+          set -eu
+          asset="./markdoc-prose-${{ matrix.slug }}${{ matrix.exe }}"
+          chmod +x "$asset"
+          version="$("$asset" --version)"
+          echo "$version"
+          [ "$version" = "markdoc-prose ${GITHUB_REF_NAME%%-*}" ] || {
+            echo "::error::the binary says '${version}', the tag is ${GITHUB_REF_NAME}" >&2; exit 1; }
+
+          mkdir -p corpus
+          cat > corpus/markdoc-prose.toml <<'TOML'
+          [[rule]]
+          name = "Etc"
+          level = "error"
+          message = "Avoid '%s' in lists. Name the specific items."
+          patterns = ['\betc\.']
+          TOML
+          cat > corpus/bad.md <<'MD'
+          ---
+          title: Screws, bolts, etc.
+          ---
+
+          Screws, bolts, etc. go in the tray.
+          MD
+          cat > corpus/engine.md <<'MD'
+          # Fitting
+
+          Please attach the the cable to {% $product %} before you start.
+          MD
+
+          set +e
+          "$asset" --json --root corpus > report.json
+          code=$?
+          set -e
+          cat report.json
+          # Exit 1 is "found something at error level", and it is what a
+          # hook and a CI step both read.
+          [ "$code" = 1 ] || { echo "::error::markdoc-prose exited ${code} on a corpus with an error-level fault" >&2; exit 1; }
+          for want in '"files": 2,?$' '"errors": 1,?$' '"warnings": 1,?$' '"rule": "Etc"' '"rule": "RepeatedWords"'; do
+            grep -qE "$want" report.json || {
+              echo "::error::markdoc-prose --json: expected $want" >&2; exit 1; }
+          done
+
+      - name: Publish to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            markdoc-prose-${{ matrix.slug }}${{ matrix.exe }}
+            markdoc-prose-${{ matrix.slug }}${{ matrix.exe }}.sha256
+          # A pattern that matches nothing is an error, not a warning: a
+          # release missing its checksum is one no consumer can verify.
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
