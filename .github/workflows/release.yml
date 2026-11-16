@@ -1,12 +1,40 @@
 # Release for markdoc-prose — https://github.com/markdoc-rs/markdoc-prose
 #
-# One tag publishes one binary per platform, all four from GitHub-hosted
+# One release publishes one binary per platform, all six from GitHub-hosted
 # runners, each with a .sha256 beside it:
 #
 #   markdoc-prose-linux-x86_64          CI runners, and Linux authoring
+#   markdoc-prose-linux-aarch64         Linux on ARM64, CI runners included
 #   markdoc-prose-windows-x86_64.exe    Windows authoring
+#   markdoc-prose-windows-aarch64.exe   Windows on ARM64
 #   markdoc-prose-macos-aarch64         Apple Silicon
 #   markdoc-prose-macos-x86_64          Intel Macs
+#
+# Each binary also gets a GitHub build-provenance attestation, which ties
+# it to the commit and the workflow run that built it. GitHub keeps it,
+# and the release carries a copy beside the binary, <asset>.sigstore.json.
+# Check a download against either:
+#
+#   gh attestation verify markdoc-prose-linux-x86_64 --repo markdoc-rs/markdoc-prose
+#   gh attestation verify markdoc-prose-linux-x86_64 --repo markdoc-rs/markdoc-prose \
+#       --bundle markdoc-prose-linux-x86_64.sigstore.json
+#
+# ## How a release happens
+#
+# Cargo.toml's version is the release. A push to main that changes
+# Cargo.toml runs this workflow, and when no tag names that version yet it
+# checks the commit, builds every binary, publishes the crate to crates.io,
+# and then creates the GitHub release, and the tag with it, on that commit.
+# A version a tag already names does nothing; one older than the newest
+# tag fails the run (.github/scripts/release_version.py says why). "Run
+# workflow" does the same on demand, to retry a release that failed. A
+# version with a pre-release part, 0.2.0-rc.1, makes a pre-release, so
+# `releases/latest` stays on the last full release.
+#
+# crates.io takes the crate through trusted publishing, so no token is
+# stored here: the crate's settings on crates.io name this repository and
+# release.yml, and can name the `release` environment the publish job runs
+# in, as allowed to publish it.
 #
 # ## Nothing has to move to these yet
 #
@@ -25,43 +53,59 @@ name: Release
 
 on:
   push:
-    tags:
-      - "[0-9]+.[0-9]+.[0-9]+"
-      - "[0-9]+.[0-9]+.[0-9]+-*"
+    branches: [main]
+    paths: [Cargo.toml]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+# One release at a time: two runs deciding at once could both find the
+# version untagged.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
+  # ────────────────────────────────────────────────────────────────────
+  # Whether this push is a release, and of which version. Everything below
+  # runs only when it is.
+  # ────────────────────────────────────────────────────────────────────
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.version.outputs.release }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Only main releases
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::${GITHUB_REF} is not main, and only main is released." >&2
+          exit 1
+
+      - uses: actions/checkout@v5
+        with:
+          path: markdoc-prose
+
+      - name: Cargo.toml's version, and whether a tag names it yet
+        id: version
+        run: python3 -I markdoc-prose/.github/scripts/release_version.py markdoc-prose
+
   # ────────────────────────────────────────────────────────────────────
   # Nothing is published until this passes. Same check.sh ci.yml runs, so
   # a release cannot hold a build the ordinary gate would have rejected.
   # ────────────────────────────────────────────────────────────────────
   check:
     name: Check
+    needs: version
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: markdoc-prose
-
-      - name: The tag and Cargo.toml have to agree
-        working-directory: markdoc-prose
-        run: |
-          set -eu
-          case "${GITHUB_REF}" in
-            refs/tags/*) ;;
-            *) echo "::error::${GITHUB_REF} is not a tag." >&2; exit 1 ;;
-          esac
-          # `markdoc-prose --version` is what a writer reports in a bug, so
-          # a release whose binary disagrees with its tag is one nobody can
-          # reason about afterwards.
-          tag="${GITHUB_REF_NAME%%-*}"
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          [ "$version" = "$tag" ] || {
-            echo "::error::Cargo.toml says ${version}, tag says ${tag}" >&2; exit 1; }
-          echo "markdoc-prose ${tag}"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -75,20 +119,30 @@ jobs:
         run: bash markdoc-prose/.github/scripts/check.sh markdoc-prose
 
   # ────────────────────────────────────────────────────────────────────
-  # The binary, per platform. One matrix, three runner images, one release.
+  # The binary, per platform. One matrix, five runner images, one release.
   # ────────────────────────────────────────────────────────────────────
   build:
     name: ${{ matrix.slug }}
-    needs: check
+    needs: [version, check]
     runs-on: ${{ matrix.os }}
+    # Signing and recording the attestation. Publishing is the job after.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          # musl and statically linked, so one Linux binary runs on a CI
-          # image older than the runner that built it.
+          # musl and statically linked, so each Linux binary runs on a CI
+          # image older than the runner that built it. The ARM64 one is
+          # built natively, on GitHub's ARM runner.
           - { slug: linux-x86_64,   os: ubuntu-latest,  target: x86_64-unknown-linux-musl, exe: "" }
+          - { slug: linux-aarch64,  os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, exe: "" }
           - { slug: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc,    exe: ".exe" }
+          # Windows on ARM64, built natively on GitHub's ARM runner. psm's
+          # assembly needs MSVC's ARM64 tools, which its image has.
+          - { slug: windows-aarch64, os: windows-11-arm, target: aarch64-pc-windows-msvc, exe: ".exe" }
           # macos-latest is Apple Silicon, and x86_64-apple-darwin
           # cross-compiles from it because Xcode ships both slices of the
           # SDK. Safe here: nothing markdoc-prose builds is C, apart from
@@ -98,7 +152,7 @@ jobs:
           - { slug: macos-x86_64,   os: macos-latest,   target: x86_64-apple-darwin,       exe: "" }
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: markdoc-prose
 
@@ -118,7 +172,7 @@ jobs:
       # needs a musl-targeting one; the other three targets have one.
       # Without it cc-rs fails: failed to find tool "x86_64-linux-musl-gcc".
       - name: musl toolchain
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+        if: endsWith(matrix.target, '-linux-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build
@@ -126,10 +180,19 @@ jobs:
         working-directory: markdoc-prose
         run: |
           set -eu
-          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
-            export CC_x86_64_unknown_linux_musl=musl-gcc
-            export RUSTFLAGS="-C target-feature=+crt-static"
-          fi
+          case "${{ matrix.target }}" in
+            *-unknown-linux-musl)
+              # cc-rs reads CC_<target>, its dashes as underscores, and
+              # musl-gcc is the native one on either runner.
+              export "CC_$(printf %s "${{ matrix.target }}" | tr - _)=musl-gcc"
+              export RUSTFLAGS="-C target-feature=+crt-static"
+              ;;
+            *-pc-windows-msvc)
+              # The C runtime linked in, as on musl, so a PC without the
+              # Visual C++ Redistributable can still start it.
+              export RUSTFLAGS="-C target-feature=+crt-static"
+              ;;
+          esac
           cargo build --release --target "${{ matrix.target }}"
 
       - name: Name it for the platform
@@ -162,6 +225,40 @@ jobs:
           fi
           echo "--- $asset: $(wc -c < "$asset") bytes"
 
+      # What the Windows build flags are for. An import of vcruntime140.dll
+      # would mean writers need the Visual C++ Redistributable after all, and
+      # the step after this would not notice: the runner has it installed.
+      - name: It needs no Visual C++ runtime
+        if: matrix.exe == '.exe'
+        shell: bash
+        run: |
+          set -eu
+          asset="markdoc-prose-${{ matrix.slug }}${{ matrix.exe }}"
+          if grep -a -q -i 'vcruntime140' "$asset"; then
+            echo "::error::$asset imports the Visual C++ runtime (vcruntime140.dll)" >&2
+            exit 1
+          fi
+          echo "$asset: the C runtime is linked in"
+
+      # musl and +crt-static are what make the Linux build static, and this
+      # checks they did: a NEEDED entry or a program interpreter would tie
+      # the binary to the libc of the runner that built it.
+      - name: It is static
+        if: endsWith(matrix.target, '-linux-musl')
+        shell: bash
+        run: |
+          set -eu
+          asset="markdoc-prose-${{ matrix.slug }}${{ matrix.exe }}"
+          if readelf -d "$asset" | grep NEEDED; then
+            echo "::error::$asset links shared libraries" >&2
+            exit 1
+          fi
+          if readelf -l "$asset" | grep -i interpreter; then
+            echo "::error::$asset asks for a dynamic loader" >&2
+            exit 1
+          fi
+          echo "$asset: static"
+
       # A binary that will not start is worse than one that was never built:
       # the consumer caches it and reports a tool that is "installed". Every
       # target but the Intel Mac cross-build can run on the runner that
@@ -176,8 +273,8 @@ jobs:
           chmod +x "$asset"
           version="$("$asset" --version)"
           echo "$version"
-          [ "$version" = "markdoc-prose ${GITHUB_REF_NAME%%-*}" ] || {
-            echo "::error::the binary says '${version}', the tag is ${GITHUB_REF_NAME}" >&2; exit 1; }
+          [ "$version" = "markdoc-prose ${{ needs.version.outputs.version }}" ] || {
+            echo "::error::the binary says '${version}', the release is ${{ needs.version.outputs.version }}" >&2; exit 1; }
 
           mkdir -p corpus
           cat > corpus/markdoc-prose.toml <<'TOML'
@@ -213,13 +310,89 @@ jobs:
               echo "::error::markdoc-prose --json: expected $want" >&2; exit 1; }
           done
 
-      - name: Publish to the release
-        uses: softprops/action-gh-release@v2
+      # Signed for this workflow run, so a download can be traced to the
+      # commit and the workflow that built it. Of the asset itself, as the
+      # .sha256 is: the bytes attested are the bytes published.
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@v4
         with:
-          files: |
+          subject-path: markdoc-prose-${{ matrix.slug }}${{ matrix.exe }}
+
+      # GitHub keeps the attestation; the release carries a copy too, beside
+      # the binary, where it can be seen and checked without asking GitHub:
+      #   gh attestation verify <asset> --bundle <asset>.sigstore.json --repo markdoc-rs/markdoc-prose
+      - name: Keep the attestation with the binary
+        shell: bash
+        run: cp "${{ steps.attest.outputs.bundle-path }}" "markdoc-prose-${{ matrix.slug }}${{ matrix.exe }}.sigstore.json"
+
+      - name: Upload for the release
+        uses: actions/upload-artifact@v6
+        with:
+          name: markdoc-prose-${{ matrix.slug }}
+          path: |
             markdoc-prose-${{ matrix.slug }}${{ matrix.exe }}
             markdoc-prose-${{ matrix.slug }}${{ matrix.exe }}.sha256
-          # A pattern that matches nothing is an error, not a warning: a
-          # release missing its checksum is one no consumer can verify.
+            markdoc-prose-${{ matrix.slug }}${{ matrix.exe }}.sigstore.json
+          if-no-files-found: error
+
+  # ────────────────────────────────────────────────────────────────────
+  # Only once every platform has built: crates.io first, since a version
+  # published there cannot be taken back and a GitHub release can be
+  # edited, and the release last, all of it at once, so `releases/latest`
+  # never holds one with a platform missing.
+  # ────────────────────────────────────────────────────────────────────
+  publish:
+    name: Publish
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    # As crates.io's trusted publishing guide recommends: an environment
+    # the trusted publisher can name, and that the repository's settings
+    # can limit to main or put behind a reviewer.
+    environment: release
+    permissions:
+      contents: write # the release, and the tag it creates
+      id-token: write # crates.io trusted publishing
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: markdoc-prose
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: What the release holds
+        run: ls -l dist
+
+      # A run that published the crate and then failed can be re-run
+      # without publishing it twice, which crates.io would refuse.
+      - name: Is this version on crates.io?
+        id: crates-io
+        run: python3 -I markdoc-prose/.github/scripts/release_version.py --on-crates-io markdoc-prose
+
+      # A token for this job only, issued against the trusted publisher
+      # set up in the crate's settings on crates.io, and revoked after.
+      - name: Authenticate to crates.io
+        id: auth
+        if: steps.crates-io.outputs.published == 'false'
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish to crates.io
+        if: steps.crates-io.outputs.published == 'false'
+        working-directory: markdoc-prose
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked
+
+      - name: Create the release, and its tag
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*
           fail_on_unmatched_files: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ needs.version.outputs.prerelease }}

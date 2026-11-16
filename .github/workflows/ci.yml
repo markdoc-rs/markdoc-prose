@@ -22,7 +22,7 @@ jobs:
     name: Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: markdoc-prose
 
@@ -173,7 +173,7 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: markdoc-prose
 
@@ -187,3 +187,52 @@ jobs:
       - name: cargo test
         working-directory: markdoc-prose
         run: cargo test --all-targets
+
+  # ────────────────────────────────────────────────────────────────────
+  # Windows on ARM64, proven here before any release depends on it. The
+  # tests run natively; then the binary is built as a release would build
+  # it, with the C runtime linked in, and is checked and run. The C in
+  # it, markdoc's stack growth (psm), assembles with MSVC's ARM64 tools,
+  # which this runner image has.
+  # ────────────────────────────────────────────────────────────────────
+  windows-arm64:
+    name: Windows on ARM64
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: markdoc-prose
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: markdoc-prose
+          key: windows-arm64
+
+      - name: cargo test
+        working-directory: markdoc-prose
+        run: cargo test --all-targets
+
+      - name: Release build, the C runtime linked in
+        shell: bash
+        working-directory: markdoc-prose
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --target aarch64-pc-windows-msvc
+
+      # What release.yml checks of every Windows binary. An import of
+      # vcruntime140.dll would mean the Visual C++ Redistributable is needed
+      # after all, and this runner, which has it installed, would not notice.
+      - name: It needs no Visual C++ runtime, and it runs
+        shell: bash
+        working-directory: markdoc-prose
+        run: |
+          set -eu
+          exe=target/aarch64-pc-windows-msvc/release/markdoc-prose.exe
+          if grep -a -q -i 'vcruntime140' "$exe"; then
+            echo "::error::$exe imports the Visual C++ runtime (vcruntime140.dll)" >&2
+            exit 1
+          fi
+          echo "$exe: $(wc -c < "$exe") bytes, the C runtime linked in"
+          "$exe" --version

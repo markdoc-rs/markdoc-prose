@@ -40,6 +40,12 @@ step() {
 # clippy fix is a confusing diff to review.
 step "cargo fmt" cargo fmt --check
 
+# Cargo.lock is committed, and has to agree with Cargo.toml: the release
+# publishes with `cargo publish --locked`, which refuses one that does not,
+# and finding that out here costs a push rather than a release.
+lock_is_current() { cargo metadata --locked --format-version 1 >/dev/null; }
+step "Cargo.lock is current" lock_is_current
+
 if [ "$STRICT" = "1" ]; then
   step "cargo clippy" cargo clippy --all-targets -- -D warnings
 else

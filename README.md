@@ -489,6 +489,26 @@ to `Cargo.toml`, and take it out before committing: CI has no siblings.
 warnings as errors, the tests, a release build, and that build starting and
 listing its rules — and it runs unchanged from a plain checkout.
 
+A release publishes `markdoc-prose-<platform>` for Linux (x86-64 and ARM64,
+static), Windows (x86-64 and ARM64) and macOS (Apple Silicon and Intel),
+each with a
+`.sha256` beside it and a GitHub build-provenance attestation, which ties
+it to the commit and the workflow run that built it:
+
+```
+gh attestation verify markdoc-prose-linux-x86_64 --repo markdoc-rs/markdoc-prose
+gh attestation verify markdoc-prose-linux-x86_64 --repo markdoc-rs/markdoc-prose \
+    --bundle markdoc-prose-linux-x86_64.sigstore.json
+```
+
+The release carries each attestation too, as `<asset>.sigstore.json`
+beside the asset; the second form checks against that copy instead of
+asking GitHub.
+
+Releasing is a version bump: push a new version in `Cargo.toml` to main,
+and `.github/workflows/release.yml` publishes the crate to crates.io and
+the binaries to a GitHub release, and tags the commit.
+
 ## Status
 
 - [x] Length-preserving pre-processing, with positions asserted against the
