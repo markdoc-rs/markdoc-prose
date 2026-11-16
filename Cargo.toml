@@ -1,6 +1,6 @@
 [package]
 name = "markdoc-prose"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/markdoc-rs/markdoc-prose"
@@ -15,7 +15,7 @@ name = "markdoc-prose"
 path = "src/bin/markdoc_prose.rs"
 
 [dependencies]
-markdoc-lint = "0.1.0"
+markdoc-lint = "0.2.0"
 # The grammar and style engine. `thesaurus` is off: it is a large data table
 # this never consults, and it costs build time and binary size on a tool
 # writers install.

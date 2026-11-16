@@ -2905,11 +2905,10 @@ dependencies = [
 
 [[package]]
 name = "markdoc-lint"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7915404821e12bfe5f8b9b9803757e773ae1c04fd238ea740bd34596fc466577"
+checksum = "1da7d5c233aaa45d361223ec40be7276ca63aba6db278ef95789abeba94cbded"
 dependencies = [
- "anyhow",
  "markdoc",
  "regex",
  "serde",
@@ -2919,7 +2918,7 @@ dependencies = [
 
 [[package]]
 name = "markdoc-prose"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "fancy-regex",
